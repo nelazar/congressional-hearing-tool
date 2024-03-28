@@ -85,6 +85,11 @@ def base_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
             env_path = Path("./data/.env")
             env_path.touch(mode=0o600)
             dotenv.set_key(env_path, 'GOVINFO_KEY', args.key)
+
+            # Setup database
+            with Database() as db:
+                if not db.created():
+                    db.create()
         else:
             raise SystemExit("error: invalid API key")
 

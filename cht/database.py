@@ -31,7 +31,7 @@ class Database:
 
 
     # Create the tables for the database or abort if they exist
-    def create(self):
+    def create(self) -> None:
         
         # Create congresses table
         self.cursor.execute(
@@ -104,7 +104,7 @@ class Database:
             """
             CREATE TABLE participants_documents (
                 participant     TEXT        NOT NULL,
-                document        TEXT,       NOT NULL,
+                document        TEXT        NOT NULL,
 
                 PRIMARY KEY (participant, document),
 
@@ -144,6 +144,17 @@ class Database:
             )
             """
         )
+
+    # Check if tables have been created yet
+    def created(self) -> bool:
+        tables = self.cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+
+        if len(tables) > 0:
+            return True
+        else:
+            return False
 
 
     ########## congresses table ##########
