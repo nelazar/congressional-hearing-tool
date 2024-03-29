@@ -4,15 +4,18 @@ Handles the command-line interface for this tool
 
 import argparse
 from datetime import datetime
-from pathlib import Path
+import os
 
 import dotenv
 
-from cht import consumer
+from cht import consumer, DATA_PATH, DOTENV_PATH, KEY_VAR, CURR_CONGRESS
 from cht.database import Database
-from cht.helper import ordinal
+from cht.helper import ordinal, valid_congress, congress_from_id
+from cht.customtypes import format_str
+from cht.transcriptparser import parse_congress
 
 
+# Setup the CLI parser
 def setup_parser() -> argparse.ArgumentParser:
 
     # Setup base command
@@ -24,31 +27,31 @@ def setup_parser() -> argparse.ArgumentParser:
         "Requires an API key for govinfo.gov to download and parse documents. "
         "You can sign up for a key at https://www.govinfo.gov/api-signup."
     )
-    parser.add_argument("-s", "--status", action="store_true",
-                        help="display the status of the database")
     parser.add_argument("-k", "--key",
                         help="sets an API key for govinfo.gov")
     parser.set_defaults(func=base_command)
     subparsers = parser.add_subparsers(title="Subcommands")
 
+    # Setup status subcommand
+    status_parser = subparsers.add_parser("status",
+                                          help="displays the status of the database")
+    status_parser.set_defaults(func=status)
+
     # Setup download subcommand
     download_parser = subparsers.add_parser("download",
                                             help="downloads a document or set of documents")
-    download_parser.add_argument("-i", "--id", nargs='+',
-                                 help="a specific document ID or list of IDs")
-    download_parser.add_argument("-c", "--congress", nargs='+',
-                                 help="a specific Congress or list of Congresses")
-    download_parser.add_argument("-f", "--format", choices=['txt', 'text', 'pdf', 'xml', 'metadata'],
-                                 help="the file type to download")
-    download_parser.add_argument("-p", "--path", default="./downloads/",
-                                 help="the directory to download the files to")
+    download_parser.add_argument("-q", "--quiet", action="store_true",
+                                 help="prints no output to the console")
+    download_parser.add_argument("-f", "--format", nargs='+', default='txt',
+                                 choices=['txt', 'text', 'pdf', 'xml', 'metadata'],
+                                 help="the file type to download, defaults to txt")
+    download_parser.add_argument("selection", nargs='+',
+                                 help="a list of document IDs or Congresses")
     download_parser.set_defaults(func=download)
 
     # Setup parse subcommand
     parse_parser = subparsers.add_parser("parse",
                                          help="parses transcripts from the specified Congresses")
-    parse_parser.add_argument("-v", "--verbose", action="store_true",
-                              help="prints the document ID of each document being parsed")
     parse_parser.add_argument("-q", "--quiet", action="store_true",
                               help="prints no output to the console")
     parse_parser.add_argument("-d", "--download", action="store_true",
@@ -73,93 +76,167 @@ def setup_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Save the given API key and setup the database
+def key_setup(key: str) -> None:
+    if consumer.test_key(key):
+        DATA_PATH.mkdir(exist_ok=True)
+        DOTENV_PATH.touch(mode=0o600)
+        dotenv.set_key(DOTENV_PATH, KEY_VAR, key)
+
+        # Setup database
+        with Database() as db:
+            if not db.created():
+                db.create()
+    else:
+        raise SystemExit("error: invalid API key")
+
+
 # Code to execute for the base command
 def base_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.key is None and not args.status:
+    if args.key is None:
         parser.print_help()
     
     # --key flag
     if args.key is not None:
-        if consumer.test_key(args.key):
-            Path("./data/").mkdir(exist_ok=True)
-            env_path = Path("./data/.env")
-            env_path.touch(mode=0o600)
-            dotenv.set_key(env_path, 'GOVINFO_KEY', args.key)
+        key_setup(args.key)
 
-            # Setup database
-            with Database() as db:
-                if not db.created():
-                    db.create()
-        else:
-            raise SystemExit("error: invalid API key")
 
-    # --status flag
-    if args.status:
+# Code to execute for the status subcommand
+def status(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    with Database() as db:
+        db.refresh_paths()
+        documents = db.get_documents()
+        txts = db.get_files('txt')
+        pdfs = db.get_files('pdf')
+        xmls = db.get_files('xml')
+
+    if len(documents) == 0 and len(txts) == 0 and len(pdfs) == 0 and len(xmls) == 0:
+        print("No documents downloaded or parsed")
+        return
+
+    print("Parsed:")
+    if len(documents) == 0:
+        print("No documents parsed")
+    else:
         with Database() as db:
-            congresses = db.get_congresses()
+            congresses = db.get_documents_congresses()
+            for congress in congresses:
+                total = len(db.get_documents(congress))
+                parsed = len(db.get_documents(congress, complete=True))
+                print(f"{ordinal(congress)} Congress: {parsed}/{total} documents")
+    print()
 
-        if len(congresses) == 0:
-            print("No documents downloaded or parsed")
-            return
+    print("Text files:")
+    if len(txts) == 0:
+        print("No text files downloaded")
+    else:
+        with Database() as db:
+            congresses = db.get_files_congresses('txt')
+            for congress in congresses:
+                total = len(db.get_files('txt', congress))
+                downloaded = len(db.get_files('txt', congress, downloaded=True))
+                print(f"{ordinal(congress)} Congress: {downloaded}/{total} documents")
+    print()
 
-        print("Parsed:")
-        printed = False
-        for congress in congresses:
-            if congress['parsed'] > 0:
-                print(f"{ordinal(congress['congress'])} Congress: "
-                      f"{congress['parsed']}/{congress['total']} documents")
-                printed = True
-        if not printed:
-            print("No documents parsed")
-        print()
+    print("PDF files:")
+    if len(pdfs) == 0:
+        print("No PDF files downloaded")
+    else:
+        with Database() as db:
+            congresses = db.get_files_congresses('pdf')
+            for congress in congresses:
+                total = len(db.get_files('pdf', congress))
+                downloaded = len(db.get_files('pdf', congress, downloaded=True))
+                print(f"{ordinal(congress)} Congress: {downloaded}/{total} documents")
+    print()
 
-        print("Text files:")
-        printed = False
-        for congress in congresses:
-            if congress['txts'] > 0:
-                print(f"{ordinal(congress['congress'])} Congress: "
-                      f"{congress['txts']}/{congress['total']} documents")
-                printed = True
-        if not printed:
-            print("No text files downloaded")
-        print()
-
-        print("PDF files:")
-        printed = False
-        for congress in congresses:
-            if congress['pdfs'] > 0:
-                print(f"{ordinal(congress['congress'])} Congress: "
-                      f"{congress['pdfs']}/{congress['total']} documents")
-                printed = True
-        if not printed:
-            print("No PDF files downloaded")
-        print()
-
-        print("Metadata:")
-        printed = False
-        for congress in congresses:
-            if congress['xmls'] > 0:
-                print(f"{ordinal(congress['congress'])} Congress: "
-                      f"{congress['xmls']}/{congress['total']} documents")
-                printed = True
-        if not printed:
-            print("No metadata downloaded")
-        print()
+    print("Metadata:")
+    if len(xmls) == 0:
+        print("No metadata files downloaded")
+    else:
+        with Database() as db:
+            congresses = db.get_files_congresses('xml')
+            for congress in congresses:
+                total = len(db.get_files('xml', congress))
+                downloaded = len(db.get_files('xml', congress, downloaded=True))
+                print(f"{ordinal(congress)} Congress: {downloaded}/{total} documents")
+    print()
 
 
 # Code to execute for the download subcommand
 def download(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    pass
+
+    # --key flag
+    if args.key is not None:
+        key_setup(args.key)
+    
+    dotenv.load_dotenv(DOTENV_PATH)
+
+    # API key required to download
+    if KEY_VAR not in os.environ:
+        parser.print_usage()
+        raise SystemExit("error: an API key must be saved using -k/--key before downloading")
+    
+    # Download files
+    to_download: list[str] = []
+    for selection in args.selection:
+
+        # All documents in a Congress
+        if selection.isnumeric():
+            if valid_congress(int(selection)):
+                congress_docs = consumer.get_list(int(selection))
+                congress_docs = list(filter(lambda x: congress_from_id(x) == int(selection), congress_docs))
+                to_download.extend(congress_docs)
+            else:
+                raise SystemExit(f"error: downloading from the {ordinal(int(selection))} Congress "
+                                 f"is not supported (valid range: 105-{CURR_CONGRESS-1})")
+        
+        # Specific IDs
+        else:
+            to_download.append(selection)
+
+    for format in args.format:
+        consumer.download_documents(to_download, format, quiet=args.quiet)
 
 
 # Code to execute for the parse subcommand
 def parse(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    pass
+    
+    # --key flag
+    if args.key is not None:
+        key_setup(args.key)
+    
+    dotenv.load_dotenv(DOTENV_PATH)
+
+    # API key required to download
+    if KEY_VAR not in os.environ:
+        parser.print_usage()
+        raise SystemExit("error: an API key must be saved using -k/--key before parsing")
+    
+    # Quiet and 
+    
+    # Validate congresses
+    congresses: list[int] = []
+    for congress in args.congress:
+        if valid_congress(int(congress)):
+            congresses.append(int(congress))
+        else:
+            raise SystemExit(f"error: parsing from the {ordinal(int(congress))} Congress "
+                             f"is not supported (valid range: 105-{CURR_CONGRESS})")
+        
+    # Parse congresses
+    for congress in congresses:
+        parse_congress(congress, args.quiet, args.download)
 
 
 # Code to execute for the export subcommand
 def export(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    pass
+    
+    # --key flag
+    if args.key is not None:
+        key_setup(args.key)
+    
+    dotenv.load_dotenv(DOTENV_PATH)
 
 
 def main() -> None:
